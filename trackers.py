@@ -2,6 +2,7 @@ import asyncio
 import socket
 import traceback
 import os
+from urllib.parse import urlparse
 
 
 class UdpTrackerProtocol(asyncio.DatagramProtocol):
@@ -37,6 +38,8 @@ class UdpTrackerProtocol(asyncio.DatagramProtocol):
         self.PEER_ID_PREFIX = '-YL0050-'.encode('utf-8')
         self.PEER_ID = self.PEER_ID_PREFIX + \
             os.urandom(20 - len(self.PEER_ID_PREFIX))
+
+        self.on_finish = asyncio.get_event_loop().create_future()
 
     def _connection_request(self):
         request = []
@@ -103,27 +106,80 @@ class UdpTrackerProtocol(asyncio.DatagramProtocol):
     def datagram_received(self, data, addr):
         try:
             action = self._check_response(data)
-            if action == self.CONNECT:
-                self.transport.sendto(self._annouce_request(data[8:16]))
-            elif action == self.ANNOUNCE:
-                interval = int.from_bytes(data[8:12], byteorder='big')
-                leechers = int.from_bytes(data[12:16], byteorder='big')
-                seeders = int.from_bytes(data[16:20], byteorder='big')
+        except Exception as e:
+            self.on_finish.set_exception(e)
+            return
 
-                peers = []
-                for i in range(leechers + seeders):
-                    peers.append({b'ip': bytes(socket.inet_ntoa(
-                        data[20 + 6 * i:24 + 6 * i]), encoding='utf-8'), b'port': int.from_bytes(data[24 + 6 * i:26 + 6 * i], byteorder='big')})
-                print(peers)
-                self.transport.close()
-            elif action == self.SCRAPE:
-                # TODO
-                pass
-            elif action == self.ERROR:
-                self.transport.close()
-                raise ValueError(data[8:].encode('utf-8'))
-            else:
-                self.transport.close()
-                raise ValueError('Invalid action in udp response')
-        except:
-            traceback.print_exc()
+        if action == self.CONNECT:
+            self.transport.sendto(self._annouce_request(data[8:16]))
+            return
+
+        if action == self.ANNOUNCE:
+            interval = int.from_bytes(data[8:12], byteorder='big')
+            leechers = int.from_bytes(data[12:16], byteorder='big')
+            seeders = int.from_bytes(data[16:20], byteorder='big')
+
+            peers = []
+            for i in range(leechers + seeders):
+                peers.append({b'ip': bytes(socket.inet_ntoa(
+                    data[20 + 6 * i:24 + 6 * i]), encoding='utf-8'), b'port': int.from_bytes(data[24 + 6 * i:26 + 6 * i], byteorder='big')})
+            self.on_finish.set_result(peers)
+        elif action == self.SCRAPE:
+            # TODO
+            pass
+        elif action == self.ERROR:
+            self.on_finish.set_exception(ValueError(data[8:].decode('utf-8')))
+        else:
+            self.on_finish.set_exception(
+                ValueError('Invalid action in udp response'))
+
+    def error_received(self, exc):
+        if not self.on_finish.done():
+            self.on_finish.set_exception(exc)
+
+    def connection_lost(self, exc):
+        if not self.on_finish.done():
+            self.on_finish.set_exception(exc)
+
+
+async def get_peer_from_udp_server(torrent, url, semaphore, timeout):
+    async with semaphore:
+        print('try connect %s' % url.geturl())
+        response = []
+        transport = None
+        loop = asyncio.get_event_loop()
+        try:
+            transport, protocol = await loop.create_datagram_endpoint(lambda: UdpTrackerProtocol(torrent), remote_addr=(url.hostname, url.port))
+            response = await asyncio.wait_for(protocol.on_finish, timeout)
+            # print(response)
+        except Exception as e:
+            print(e)
+            #traceback.print_exc()
+        finally:
+            if transport:
+                transport.close()
+            return response
+
+async def get_peers_from_udp_server(torrent, max_connection=256, timeout=None):
+    semaphore = asyncio.Semaphore(max_connection)
+    works = [get_peer_from_udp_server(torrent, urlparse(tracker), semaphore, timeout)
+             for tracker in torrent.trackers if urlparse(tracker).scheme == 'udp']
+    done, _ = await asyncio.wait(works)
+    
+    results = []
+    for response in done:
+        results += response.result()
+
+    return results
+
+def get_peers(torrent):
+    loop = asyncio.get_event_loop()
+    result = loop.run_until_complete(get_peers_from_udp_server(torrent, timeout=5))
+    loop.close()
+
+    unique = []
+    for r in result:
+        if r not in unique:
+            unique += r
+
+    return unique
