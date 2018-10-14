@@ -2,8 +2,13 @@ import asyncio
 import socket
 import traceback
 import os
-from urllib.parse import urlparse
+import aiohttp
+import urllib.parse
+import bencoding
 
+DEFAULT_PORT = 6881
+PEER_ID_PREFIX = '-YL0050-'.encode('utf-8')
+PEER_ID = PEER_ID_PREFIX + os.urandom(20 - len(PEER_ID_PREFIX))
 
 class UdpTrackerProtocol(asyncio.DatagramProtocol):
     """ UDP Tracker Protocol for BitTorrent
@@ -15,8 +20,6 @@ class UdpTrackerProtocol(asyncio.DatagramProtocol):
         self.torrent = torrent
 
         self.MAGIC_CONSTANT = 0x41727101980
-
-        self.DEFAULT_PORT = 6881
 
         self.CONNECT = 0
         self.ANNOUNCE = 1
@@ -34,10 +37,6 @@ class UdpTrackerProtocol(asyncio.DatagramProtocol):
         self.END_OF_OPTIONS = 0
         self.NOP = 1
         self.URL_DATA = 2
-
-        self.PEER_ID_PREFIX = '-YL0050-'.encode('utf-8')
-        self.PEER_ID = self.PEER_ID_PREFIX + \
-            os.urandom(20 - len(self.PEER_ID_PREFIX))
 
         self.on_finish = asyncio.get_event_loop().create_future()
 
@@ -57,7 +56,7 @@ class UdpTrackerProtocol(asyncio.DatagramProtocol):
         self.transaction_id = os.urandom(4)
         request += self.transaction_id
         request += self.torrent.hash
-        request += self.PEER_ID
+        request += PEER_ID
         request += (downloaded).to_bytes(8, byteorder='big')  # downloaded
         request += (self.torrent.length).to_bytes(8, byteorder='big')  # left
         request += (uploaded).to_bytes(8, byteorder='big')  # uploaded
@@ -66,7 +65,7 @@ class UdpTrackerProtocol(asyncio.DatagramProtocol):
         request += (key).to_bytes(4, byteorder='big')  # key
         request += (num_wait).to_bytes(4, byteorder='big',
                                        signed=True)  # num_want
-        request += (self.DEFAULT_PORT).to_bytes(2, byteorder='big')  # port
+        request += (DEFAULT_PORT).to_bytes(2, byteorder='big')  # port
 
         request += (self.URL_DATA).to_bytes(1, byteorder='big')
         request += (len(url_data)).to_bytes(1, byteorder='big')
@@ -115,7 +114,8 @@ class UdpTrackerProtocol(asyncio.DatagramProtocol):
             return
 
         if action == self.ANNOUNCE:
-            interval = int.from_bytes(data[8:12], byteorder='big')
+            # TODO support interval
+            #interval = int.from_bytes(data[8:12], byteorder='big')
             leechers = int.from_bytes(data[12:16], byteorder='big')
             seeders = int.from_bytes(data[16:20], byteorder='big')
 
@@ -141,6 +141,28 @@ class UdpTrackerProtocol(asyncio.DatagramProtocol):
         if not self.on_finish.done():
             self.on_finish.set_exception(exc)
 
+async def get_peer_from_http_server(torrent, url, semaphore, timeout):
+    async with semaphore:
+        print('try connect %s' % url)
+        response = []
+        params = {
+            'info_hash': urllib.parse.quote_from_bytes(torrent.hash),
+            'peer_id': urllib.parse.quote_from_bytes(PEER_ID),
+            'port': DEFAULT_PORT,
+            'uploaded': 0,
+            'downloaded': 0,
+            'left': torrent.length,
+        }
+        try:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout)) as session:
+                async with session.get(url, params=params) as resp:
+                    response = await resp.read()
+        except Exception as e:
+            print(e)
+            #traceback.print_exc()
+        finally:
+            return response
+
 
 async def get_peer_from_udp_server(torrent, url, semaphore, timeout):
     async with semaphore:
@@ -160,10 +182,37 @@ async def get_peer_from_udp_server(torrent, url, semaphore, timeout):
                 transport.close()
             return response
 
+async def get_peers_from_http_server(torrent, max_connection=256, timeout=None):
+    semaphore = asyncio.Semaphore(max_connection)
+    works = [get_peer_from_http_server(torrent, tracker, semaphore, timeout)
+             for tracker in torrent.trackers if urllib.parse.urlparse(tracker).scheme == 'http' or urllib.parse.urlparse(tracker).scheme == 'https']
+    done, _ = await asyncio.wait(works)
+    
+    results = []
+    for response in done:
+        resdata = {}
+        try:
+            resdata = bencoding.decode(response.result())
+        except Exception as e:
+            print(e)
+
+        if b'peers' in resdata.keys():
+            peers = resdata[b'peers']
+            if isinstance(peers, bytes):
+                ret = []
+                for i in range(len(peers) // 6):
+                    ret.append({b'ip': bytes(socket.inet_ntoa(
+                        peers[6 * i:4 + 6 * i]), encoding='utf-8'), b'port': int.from_bytes(peers[4 + 6 * i:6 + 6 * i], byteorder='big')})
+                    results += ret
+            else:
+                results += peers
+
+    return results
+
 async def get_peers_from_udp_server(torrent, max_connection=256, timeout=None):
     semaphore = asyncio.Semaphore(max_connection)
-    works = [get_peer_from_udp_server(torrent, urlparse(tracker), semaphore, timeout)
-             for tracker in torrent.trackers if urlparse(tracker).scheme == 'udp']
+    works = [get_peer_from_udp_server(torrent, urllib.parse.urlparse(tracker), semaphore, timeout)
+             for tracker in torrent.trackers if urllib.parse.urlparse(tracker).scheme == 'udp']
     done, _ = await asyncio.wait(works)
     
     results = []
@@ -174,12 +223,13 @@ async def get_peers_from_udp_server(torrent, max_connection=256, timeout=None):
 
 def get_peers(torrent):
     loop = asyncio.get_event_loop()
-    result = loop.run_until_complete(get_peers_from_udp_server(torrent, timeout=5))
+    result = loop.run_until_complete(get_peers_from_http_server(torrent, timeout=10))
+    result += loop.run_until_complete(get_peers_from_udp_server(torrent, timeout=5))
     loop.close()
 
     unique = []
     for r in result:
         if r not in unique:
-            unique += r
+            unique.append(r)
 
     return unique

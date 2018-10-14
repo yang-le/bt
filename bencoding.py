@@ -36,7 +36,7 @@ def decode(data):
     Bdecode data into Python built-in types.
     '''
 
-    return consume(LookaheadIterator(data))
+    return consume(LookaheadIterator([bytes([b]) for b in data]))
 
 
 class LookaheadIterator(collections.Iterator):

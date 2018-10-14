@@ -8,7 +8,7 @@ class TorrentFile:
         data = f.read()
         f.close()
 
-        self.__torrent = decode([bytes([b]) for b in data])
+        self.__torrent = decode(data)
 
         self.__trackers = []
         if b'announce-list' in self.__torrent.keys():
