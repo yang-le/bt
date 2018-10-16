@@ -6,9 +6,11 @@ import aiohttp
 import urllib.parse
 import bencoding
 
+
 DEFAULT_PORT = 6881
 PEER_ID_PREFIX = '-YL0050-'.encode('utf-8')
 PEER_ID = PEER_ID_PREFIX + os.urandom(20 - len(PEER_ID_PREFIX))
+
 
 class UdpTrackerProtocol(asyncio.DatagramProtocol):
     """ UDP Tracker Protocol for BitTorrent
@@ -115,7 +117,7 @@ class UdpTrackerProtocol(asyncio.DatagramProtocol):
 
         if action == self.ANNOUNCE:
             # TODO support interval
-            #interval = int.from_bytes(data[8:12], byteorder='big')
+            interval = int.from_bytes(data[8:12], byteorder='big')
             leechers = int.from_bytes(data[12:16], byteorder='big')
             seeders = int.from_bytes(data[16:20], byteorder='big')
 
@@ -123,7 +125,7 @@ class UdpTrackerProtocol(asyncio.DatagramProtocol):
             for i in range(leechers + seeders):
                 peers.append({b'ip': bytes(socket.inet_ntoa(
                     data[20 + 6 * i:24 + 6 * i]), encoding='utf-8'), b'port': int.from_bytes(data[24 + 6 * i:26 + 6 * i], byteorder='big')})
-            self.on_finish.set_result(peers)
+            self.on_finish.set_result((interval, peers))
         elif action == self.SCRAPE:
             # TODO
             pass
@@ -141,10 +143,11 @@ class UdpTrackerProtocol(asyncio.DatagramProtocol):
         if not self.on_finish.done():
             self.on_finish.set_exception(exc)
 
+
 async def get_peer_from_http_server(torrent, url, semaphore, timeout):
     async with semaphore:
         print('try connect %s' % url)
-        response = []
+        response = None
         params = {
             'info_hash': urllib.parse.quote_from_bytes(torrent.hash),
             'peer_id': urllib.parse.quote_from_bytes(PEER_ID),
@@ -159,77 +162,59 @@ async def get_peer_from_http_server(torrent, url, semaphore, timeout):
                     response = await resp.read()
         except Exception as e:
             print(e)
-            #traceback.print_exc()
+            # traceback.print_exc()
         finally:
-            return response
+            interval = -1
+            peers = []
+
+            resdata = {}
+            if (response):
+                try:
+                    resdata = bencoding.decode(response)
+                except Exception as e:
+                    print(e)
+
+            if b'failure reason' in resdata.keys():
+                print(resdata[b'failure reason'])
+
+            if b'interval' in resdata.keys():
+                interval = resdata[b'interval']
+
+            if b'peers' in resdata.keys():
+                peer_list = resdata[b'peers']
+                if isinstance(peer_list, bytes):
+                    for i in range(len(peer_list) // 6):
+                        peers.append({b'ip': bytes(socket.inet_ntoa(
+                            peer_list[6 * i:4 + 6 * i]), encoding='utf-8'), b'port': int.from_bytes(peer_list[4 + 6 * i:6 + 6 * i], byteorder='big')})
+                else:
+                    peers = peer_list
+            return interval, peers
 
 
 async def get_peer_from_udp_server(torrent, url, semaphore, timeout):
     async with semaphore:
         print('try connect %s' % url.geturl())
-        response = []
+        interval = -1
+        peers = []
         transport = None
         loop = asyncio.get_event_loop()
         try:
             transport, protocol = await loop.create_datagram_endpoint(lambda: UdpTrackerProtocol(torrent), remote_addr=(url.hostname, url.port))
-            response = await asyncio.wait_for(protocol.on_finish, timeout)
+            interval, peers = await asyncio.wait_for(protocol.on_finish, timeout)
             # print(response)
         except Exception as e:
             print(e)
-            #traceback.print_exc()
+            # traceback.print_exc()
         finally:
             if transport:
                 transport.close()
-            return response
+            return interval, peers
 
-async def get_peers_from_http_server(torrent, max_connection=256, timeout=None):
-    semaphore = asyncio.Semaphore(max_connection)
-    works = [get_peer_from_http_server(torrent, tracker, semaphore, timeout)
-             for tracker in torrent.trackers if urllib.parse.urlparse(tracker).scheme == 'http' or urllib.parse.urlparse(tracker).scheme == 'https']
-    done, _ = await asyncio.wait(works)
-    
-    results = []
-    for response in done:
-        resdata = {}
-        try:
-            resdata = bencoding.decode(response.result())
-        except Exception as e:
-            print(e)
 
-        if b'peers' in resdata.keys():
-            peers = resdata[b'peers']
-            if isinstance(peers, bytes):
-                ret = []
-                for i in range(len(peers) // 6):
-                    ret.append({b'ip': bytes(socket.inet_ntoa(
-                        peers[6 * i:4 + 6 * i]), encoding='utf-8'), b'port': int.from_bytes(peers[4 + 6 * i:6 + 6 * i], byteorder='big')})
-                    results += ret
-            else:
-                results += peers
-
-    return results
-
-async def get_peers_from_udp_server(torrent, max_connection=256, timeout=None):
-    semaphore = asyncio.Semaphore(max_connection)
-    works = [get_peer_from_udp_server(torrent, urllib.parse.urlparse(tracker), semaphore, timeout)
-             for tracker in torrent.trackers if urllib.parse.urlparse(tracker).scheme == 'udp']
-    done, _ = await asyncio.wait(works)
-    
-    results = []
-    for response in done:
-        results += response.result()
-
-    return results
-
-def get_peers(torrent):
-    loop = asyncio.get_event_loop()
-    result = loop.run_until_complete(get_peers_from_http_server(torrent, timeout=10))
-    result += loop.run_until_complete(get_peers_from_udp_server(torrent, timeout=5))
-    loop.close()
-
-    unique = []
-    for r in result:
-        if r not in unique:
-            unique.append(r)
-
-    return unique
+async def get_peer_from_tracker(torrent, url, semaphore):
+    tracker_url = urllib.parse.urlparse(url)
+    if tracker_url.scheme == 'udp':
+        return await get_peer_from_udp_server(torrent, tracker_url, semaphore, 5)
+    if tracker_url.scheme == 'http' or tracker_url.scheme == 'https':
+        return await get_peer_from_http_server(torrent, url, semaphore, 10)
+    return -1, []

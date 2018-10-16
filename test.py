@@ -1,4 +1,4 @@
-import trackers
+import peerpool
 import torrent
 
-print(trackers.get_peers(torrent.TorrentFile('test.torrent')))
+peerpool.start_peer_pool(torrent.TorrentFile('test.torrent'))
