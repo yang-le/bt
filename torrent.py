@@ -38,3 +38,27 @@ class TorrentFile:
     @property
     def hash(self):
         return self.__hash
+    
+    @property
+    def name(self):
+        return self.__info[b'name'].decode()
+    
+    @property
+    def piece_length(self):
+        return self.__info[b'piece_length']
+
+    def piece_hash(self, index):
+        pieces = self.__info[b'pieces']
+        return pieces[20 * index:20 * (index + 1)]
+
+    def list_files(self):
+        print("%s %d" % (self.name, self.length))
+        if b'files' in self.__info.keys():
+            for f in self.__info[b'files']:
+                path = ''
+                for p in f[b'path']:
+                    path += p.decode() + '/'
+                print("%s %d" % (path[:-1], f[b'length']))
+
+    def dump(self):
+        print(self.__torrent)
